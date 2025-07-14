@@ -2,9 +2,13 @@ package main
 
 import (
 	"bytes"
-	"github.com/Binit-Dhakal/ws"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"time"
+
+	"github.com/Binit-Dhakal/ws"
 )
 
 // client is middleman between hub and websocket connection
@@ -24,33 +28,69 @@ func (c *Client) readPump() {
 	for {
 		frame, err := c.conn.ReadFrame()
 		if err != nil {
-			log.Printf("Error while reading frame: %v", err)
+			if err == io.EOF {
+				log.Println("Client disconnected gracefully")
+			} else {
+				log.Printf("Error while reading frame: %v", err)
+			}
 			break
 		}
-		message := bytes.TrimSpace(
-			bytes.Replace(frame.Payload, []byte{'\n'}, []byte{' '}, -1),
-		)
-		c.hub.broadcast <- message
+		switch frame.OpCode {
+		case ws.OpcodeClose:
+			return
+		case ws.OpcodePong:
+			fmt.Println("Received pong")
+		case ws.OpcodeBinary:
+		case ws.OpcodeText:
+			message := bytes.TrimSpace(
+				bytes.Replace(frame.Payload, []byte{'\n'}, []byte{' '}, -1),
+			)
+			c.hub.broadcast <- message
+		default:
+			fmt.Println("Unknown opcode", frame.OpCode)
+			break
+		}
 	}
 }
 
 // writePump pumps messages from hub to the websocket connection
 func (c *Client) writePump() {
+	pingTicker := time.NewTicker(time.Second * 9)
 	defer func() {
+		pingTicker.Stop()
 		c.conn.Conn.Close()
 	}()
 
-	for {
-		message, ok := <-c.send
-		if !ok {
-			// the hub closed the channel
-			c.conn.WriteCloseFrame()
-			return
+	pingChan := make(chan bool, 1)
+	// Goroutine to send periodic message
+	go func() {
+		for range pingTicker.C {
+			select {
+			case pingChan <- true:
+			default:
+				// channel full skip this beat
+			}
 		}
-		err := c.conn.WriteTextFrame(string(message))
-		if err != nil {
-			c.conn.WriteCloseFrame()
-			return
+	}()
+
+	for {
+		select {
+		case message, ok := <-c.send:
+			if !ok {
+				// the hub closed the channel
+				c.conn.WriteCloseFrame()
+				return
+			}
+			err := c.conn.WriteTextFrame(string(message))
+			if err != nil {
+				c.conn.WriteCloseFrame()
+				return
+			}
+		case <-pingTicker.C:
+			err := c.conn.WritePingFrame([]byte{})
+			if err != nil {
+				return
+			}
 		}
 	}
 }
